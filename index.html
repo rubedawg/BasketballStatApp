@@ -8,6 +8,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <style>
   :root{
     --font-display:'Oswald',Impact,'Arial Narrow',sans-serif;
@@ -235,64 +236,58 @@
 (function(){
   "use strict";
 
-  var STORE_KEY = "bballStatTracker_v1";
-  var uid = function(){ return Math.random().toString(36).slice(2,9) + Date.now().toString(36); };
+  var SUPABASE_URL = "https://llnazxvqvhbhchfbybxf.supabase.co";
+  var SUPABASE_KEY = "sb_publishable_LNVz-Up7_DD0bSx-2sK16Q_oE9JkWfD";
+  var sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
-  var defaultState = function(){
-    return {
-      teamName: "Toronto Lords U14",
-      roster: [],
-      activeGame: null,
-      games: [],
-      view: "live",
-      historySub: "games",
-      expandedPlayer: null,
-      openGameId: null,
-      showRecent: false,
-      seasonSort: { field: "pts", dir: "desc" }
-    };
+  var uid = function(){
+    if(window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID();
+    return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function(c){
+      var r = Math.random()*16|0, v = c==="x" ? r : (r&0x3|0x8);
+      return v.toString(16);
+    });
   };
 
-  var S = load();
+  // maps our in-app field name to the DB column (DB uses "tov" since TO is reserved)
+  var FIELD_TO_DB = {fg2m:"fg2m",fg2a:"fg2a",fg3m:"fg3m",fg3a:"fg3a",ftm:"ftm",fta:"fta",
+    reb:"reb",ast:"ast",stl:"stl",blk:"blk",to:"tov",pf:"pf"};
 
-  function load(){
-    try{
-      var raw = localStorage.getItem(STORE_KEY);
-      if(!raw) return defaultState();
-      var parsed = JSON.parse(raw);
-      var d = defaultState();
-      for(var k in d){ if(!(k in parsed)) parsed[k] = d[k]; }
-      return parsed;
-    }catch(e){
-      return defaultState();
-    }
-  }
-
-  function persist(){
-    try{ localStorage.setItem(STORE_KEY, JSON.stringify(S)); }
-    catch(e){ /* storage unavailable — app still works for this session */ }
-  }
-
-  function save(){ persist(); render(); }
+  var S = {
+    teamName: "Toronto Lords U14",
+    roster: [],
+    activeGame: null,
+    games: [],
+    loaded: false,
+    view: "live",
+    historySub: "games",
+    expandedPlayer: null,
+    openGameId: null,
+    showRecent: false,
+    seasonSort: { field: "pts", dir: "desc" }
+  };
 
   // ---------- stat helpers ----------
   var EMPTY_STATS = function(){
     return {fg2m:0,fg2a:0,fg3m:0,fg3a:0,ftm:0,fta:0,reb:0,ast:0,stl:0,blk:0,to:0,pf:0};
   };
+  function rowToStats(r){
+    return {fg2m:r.fg2m,fg2a:r.fg2a,fg3m:r.fg3m,fg3a:r.fg3a,ftm:r.ftm,fta:r.fta,
+      reb:r.reb,ast:r.ast,stl:r.stl,blk:r.blk,to:r.tov,pf:r.pf};
+  }
 
   var STAT_ACTIONS = {
-    fg2m: {label:"2PT Made", also:["fg2a"], pts:2, cls:"make"},
-    fg2x: {label:"2PT Miss", also:[], pts:0, cls:""},
-    fg3m: {label:"3PT Made", also:["fg3a"], pts:3, cls:"make"},
-    fg3x: {label:"3PT Miss", also:[], pts:0, cls:""},
-    ftm:  {label:"FT Made",  also:["fta"], pts:1, cls:"make"},
-    ftx:  {label:"FT Miss",  also:[], pts:0, cls:""},
-    reb:  {label:"Rebound", also:[], pts:0, cls:"hustle"},
-    ast:  {label:"Assist",  also:[], pts:0, cls:"hustle"},
-    stl:  {label:"Steal",   also:[], pts:0, cls:"hustle"},
-    blk:  {label:"Block",   also:[], pts:0, cls:"hustle"},
-    to:   {label:"Turnover",also:[], pts:0, cls:"neg"},
-    pf:   {label:"Foul",    also:[], pts:0, cls:"neg"}
+    fg2m: {label:"2PT Made", also:["fg2a"], cls:"make"},
+    fg2x: {label:"2PT Miss", also:[], cls:""},
+    fg3m: {label:"3PT Made", also:["fg3a"], cls:"make"},
+    fg3x: {label:"3PT Miss", also:[], cls:""},
+    ftm:  {label:"FT Made",  also:["fta"], cls:"make"},
+    ftx:  {label:"FT Miss",  also:[], cls:""},
+    reb:  {label:"Rebound", also:[], cls:"hustle"},
+    ast:  {label:"Assist",  also:[], cls:"hustle"},
+    stl:  {label:"Steal",   also:[], cls:"hustle"},
+    blk:  {label:"Block",   also:[], cls:"hustle"},
+    to:   {label:"Turnover",also:[], cls:"neg"},
+    pf:   {label:"Foul",    also:[], cls:"neg"}
   };
 
   function calcPts(st){ return (st.fg2m||0)*2 + (st.fg3m||0)*3 + (st.ftm||0); }
@@ -317,56 +312,149 @@
     return d.getFullYear()+"-"+m+"-"+day;
   }
 
-  // ---------- game actions ----------
-  function startGame(opponent, date){
+  function logErr(where, error){ if(error) console.error(where, error); }
+
+  // ---------- fetching shared state from Supabase ----------
+  async function fetchSettings(){
+    var res = await sb.from("settings").select("team_name").eq("id", true).single();
+    logErr("fetchSettings", res.error);
+    if(res.data) S.teamName = res.data.team_name;
+  }
+
+  async function fetchRoster(){
+    var res = await sb.from("players").select("*").eq("active", true).order("created_at");
+    logErr("fetchRoster", res.error);
+    S.roster = (res.data||[]).map(function(p){ return {id:p.id, number:p.number, name:p.name}; });
+  }
+
+  async function fetchActiveGame(){
+    var gRes = await sb.from("games").select("*").eq("status","live").maybeSingle();
+    logErr("fetchActiveGame", gRes.error);
+    var game = gRes.data;
+    if(!game){ S.activeGame = null; return; }
+    var sRes = await sb.from("game_stats").select("*").eq("game_id", game.id);
+    var lRes = await sb.from("game_log").select("*").eq("game_id", game.id).order("ts");
+    logErr("fetchActiveGame stats", sRes.error);
+    logErr("fetchActiveGame log", lRes.error);
+    var statsRows = sRes.data || [];
+    var stats = {};
+    var players = statsRows.map(function(r){
+      stats[r.player_id] = rowToStats(r);
+      return {id:r.player_id, number:r.player_number, name:r.player_name};
+    });
     S.activeGame = {
-      id: uid(),
-      opponent: opponent || "Opponent",
-      date: date || todayISO(),
-      players: S.roster.map(function(p){ return {id:p.id, name:p.name, number:p.number}; }),
-      stats: {},
-      oppScore: 0,
-      log: []
+      id: game.id, opponent: game.opponent, date: game.date, oppScore: game.opp_score,
+      players: players, stats: stats,
+      log: (lRes.data||[]).map(function(r){
+        return {id:r.id, ts:new Date(r.ts).getTime(), type:r.type, playerId:r.player_id,
+          playerLabel:r.player_label, actionLabel:r.action_label, fields:r.fields};
+      })
     };
-    S.activeGame.players.forEach(function(p){ S.activeGame.stats[p.id] = EMPTY_STATS(); });
+  }
+
+  async function fetchHistory(){
+    var gRes = await sb.from("games").select("*").eq("status","final").order("date",{ascending:false}).order("created_at",{ascending:false});
+    logErr("fetchHistory games", gRes.error);
+    var games = gRes.data || [];
+    var ids = games.map(function(g){ return g.id; });
+    var statsRows = [];
+    if(ids.length){
+      var sRes = await sb.from("game_stats").select("*").in("game_id", ids);
+      logErr("fetchHistory stats", sRes.error);
+      statsRows = sRes.data || [];
+    }
+    var byGame = {};
+    statsRows.forEach(function(r){
+      if(!byGame[r.game_id]) byGame[r.game_id] = {players:[], stats:{}};
+      byGame[r.game_id].players.push({id:r.player_id, number:r.player_number, name:r.player_name});
+      byGame[r.game_id].stats[r.player_id] = rowToStats(r);
+    });
+    S.games = games.map(function(g){
+      var extra = byGame[g.id] || {players:[], stats:{}};
+      return {
+        id:g.id, opponent:g.opponent, date:g.date, oppScore:g.opp_score,
+        players: extra.players, stats: extra.stats,
+        finalUs: g.final_us, finalThem: g.final_them, result: g.result
+      };
+    });
+  }
+
+  async function refetchAll(){
+    await Promise.all([fetchSettings(), fetchRoster(), fetchActiveGame(), fetchHistory()]);
+  }
+
+  // ---------- game actions ----------
+  async function startGame(opponent, date){
+    var gid = uid();
+    var players = S.roster.map(function(p){ return {id:p.id, name:p.name, number:p.number}; });
+    var stats = {};
+    players.forEach(function(p){ stats[p.id] = EMPTY_STATS(); });
+    S.activeGame = { id: gid, opponent: opponent || "Opponent", date: date || todayISO(),
+      players: players, stats: stats, oppScore: 0, log: [] };
     S.expandedPlayer = null;
-    save();
+    render();
+
+    var gameRes = await sb.from("games").insert({id: gid, opponent: opponent || "Opponent", date: date || todayISO(), status:"live", opp_score:0});
+    if(gameRes.error){
+      logErr("startGame", gameRes.error);
+      alert("Couldn't start the game \u2014 someone may have just started one from another device. Reloading.");
+      await refetchAll(); render();
+      return;
+    }
+    var rows = players.map(function(p){ return {game_id: gid, player_id: p.id, player_number: p.number, player_name: p.name}; });
+    if(rows.length){
+      var statsRes = await sb.from("game_stats").insert(rows);
+      logErr("startGame stats insert", statsRes.error);
+    }
   }
 
   function ensurePlayerStats(pid){
     if(!S.activeGame.stats[pid]) S.activeGame.stats[pid] = EMPTY_STATS();
   }
 
-  function recordPlayerAction(pid, actionKey){
+  async function recordPlayerAction(pid, actionKey){
     var g = S.activeGame; if(!g) return;
     ensurePlayerStats(pid);
     var spec = STAT_ACTIONS[actionKey];
-    var changed = [];
     var primaryField = ({fg2m:"fg2m",fg2x:"fg2a",fg3m:"fg3m",fg3x:"fg3a",ftm:"ftm",ftx:"fta",
                           reb:"reb",ast:"ast",stl:"stl",blk:"blk",to:"to",pf:"pf"})[actionKey];
-    g.stats[pid][primaryField] = (g.stats[pid][primaryField]||0) + 1;
-    changed.push({field:primaryField, delta:1});
-    spec.also.forEach(function(f){
-      g.stats[pid][f] = (g.stats[pid][f]||0) + 1;
-      changed.push({field:f, delta:1});
-    });
+    var changed = [{field:primaryField, delta:1}];
+    spec.also.forEach(function(f){ changed.push({field:f, delta:1}); });
+
+    changed.forEach(function(c){ g.stats[pid][c.field] = (g.stats[pid][c.field]||0) + c.delta; });
     var pl = g.players.find(function(p){return p.id===pid;});
-    g.log.push({
-      id: uid(), ts: Date.now(), type:"player", playerId: pid,
+    var logId = uid(), nowIso = new Date().toISOString();
+    var logEntry = { id: logId, ts: Date.now(), type:"player", playerId: pid,
       playerLabel: pl ? ("#"+pl.number+" "+pl.name) : "Player",
-      actionLabel: spec.label, fields: changed
+      actionLabel: spec.label, fields: changed };
+    g.log.push(logEntry);
+    render();
+
+    var calls = changed.map(function(c){
+      return sb.rpc("increment_game_stat", {p_game_id: g.id, p_player_id: pid, p_field: FIELD_TO_DB[c.field], p_delta: c.delta});
     });
-    save();
+    calls.push(sb.from("game_log").insert({id: logId, game_id: g.id, ts: nowIso, type:"player",
+      player_id: pid, player_label: logEntry.playerLabel, action_label: spec.label, fields: changed}));
+    var results = await Promise.all(calls);
+    results.forEach(function(r){ logErr("recordPlayerAction", r.error); });
   }
 
-  function recordOppPoints(delta){
+  async function recordOppPoints(delta){
     var g = S.activeGame; if(!g) return;
     g.oppScore = Math.max(0, g.oppScore + delta);
-    g.log.push({id:uid(), ts:Date.now(), type:"opp", delta: delta, playerLabel:"Opponent", actionLabel: (delta>0?"+":"")+delta+" pts"});
-    save();
+    var logId = uid(), nowIso = new Date().toISOString();
+    var label = (delta>0?"+":"")+delta+" pts";
+    g.log.push({id:logId, ts:Date.now(), type:"opp", delta: delta, playerLabel:"Opponent", actionLabel: label});
+    render();
+
+    var r1 = await sb.rpc("increment_opp_score", {p_game_id: g.id, p_delta: delta});
+    logErr("recordOppPoints", r1.error);
+    var r2 = await sb.from("game_log").insert({id: logId, game_id: g.id, ts: nowIso, type:"opp",
+      player_label:"Opponent", action_label: label, fields: {delta: delta}});
+    logErr("recordOppPoints log", r2.error);
   }
 
-  function setOppScoreDirect(){
+  async function setOppScoreDirect(){
     var g = S.activeGame; if(!g) return;
     var cur = g.oppScore;
     var val = window.prompt("Set opponent score", String(cur));
@@ -376,58 +464,87 @@
     var delta = n - cur;
     if(delta === 0) return;
     g.oppScore = n;
-    g.log.push({id:uid(), ts:Date.now(), type:"opp", delta: delta, playerLabel:"Opponent", actionLabel:"Score set to "+n});
-    save();
+    var logId = uid(), nowIso = new Date().toISOString();
+    var label = "Score set to "+n;
+    g.log.push({id:logId, ts:Date.now(), type:"opp", delta: delta, playerLabel:"Opponent", actionLabel: label});
+    render();
+
+    var r1 = await sb.from("games").update({opp_score: n, updated_at: nowIso}).eq("id", g.id);
+    logErr("setOppScoreDirect", r1.error);
+    var r2 = await sb.from("game_log").insert({id: logId, game_id: g.id, ts: nowIso, type:"opp",
+      player_label:"Opponent", action_label: label, fields: {delta: delta}});
+    logErr("setOppScoreDirect log", r2.error);
   }
 
-  function undoLogEntry(entryId){
+  async function undoLogEntry(entryId){
     var g = S.activeGame; if(!g) return;
     var idx = g.log.findIndex(function(e){return e.id===entryId;});
     if(idx === -1) return;
     var entry = g.log[idx];
+    var calls = [];
     if(entry.type === "player"){
       ensurePlayerStats(entry.playerId);
       entry.fields.forEach(function(f){
         g.stats[entry.playerId][f.field] = Math.max(0, (g.stats[entry.playerId][f.field]||0) - f.delta);
+        calls.push(sb.rpc("increment_game_stat", {p_game_id: g.id, p_player_id: entry.playerId, p_field: FIELD_TO_DB[f.field], p_delta: -f.delta}));
       });
     } else if(entry.type === "opp"){
       g.oppScore = Math.max(0, g.oppScore - entry.delta);
+      calls.push(sb.rpc("increment_opp_score", {p_game_id: g.id, p_delta: -entry.delta}));
     }
     g.log.splice(idx,1);
-    save();
+    render();
+
+    calls.push(sb.from("game_log").delete().eq("id", entryId));
+    var results = await Promise.all(calls);
+    results.forEach(function(r){ logErr("undoLogEntry", r.error); });
   }
 
-  function endGame(){
+  async function endGame(){
     var g = S.activeGame; if(!g) return;
     var us = teamScore(g);
     var them = g.oppScore;
-    var finished = {
-      id: g.id, opponent: g.opponent, date: g.date,
-      players: g.players, stats: g.stats, oppScore: g.oppScore,
-      finalUs: us, finalThem: them,
-      result: us>them ? "W" : (us<them ? "L" : "T")
-    };
+    var result = us>them ? "W" : (us<them ? "L" : "T");
+    var finished = { id: g.id, opponent: g.opponent, date: g.date, players: g.players,
+      stats: g.stats, oppScore: g.oppScore, finalUs: us, finalThem: them, result: result };
     S.games.unshift(finished);
     S.activeGame = null;
     S.view = "history";
     S.historySub = "games";
     S.openGameId = finished.id;
-    save();
+    render();
+
+    var r = await sb.from("games").update({status:"final", final_us:us, final_them:them,
+      result: result, updated_at: new Date().toISOString()}).eq("id", finished.id);
+    logErr("endGame", r.error);
   }
 
   // ---------- roster actions ----------
-  function addPlayer(number, name){
+  async function addPlayer(number, name){
     name = (name||"").trim();
     if(!name) return;
-    S.roster.push({id: uid(), number: (number||"").trim(), name: name});
-    save();
+    var id = uid();
+    S.roster.push({id: id, number: (number||"").trim(), name: name});
+    render();
+    var r = await sb.from("players").insert({id: id, number: (number||"").trim(), name: name, active: true});
+    logErr("addPlayer", r.error);
   }
-  function removePlayer(id){
+  async function removePlayer(id){
     var p = S.roster.find(function(x){return x.id===id;});
     if(!p) return;
     if(!window.confirm("Remove "+p.name+" from the roster? Past game stats stay saved.")) return;
     S.roster = S.roster.filter(function(x){return x.id!==id;});
-    save();
+    render();
+    var r = await sb.from("players").update({active:false}).eq("id", id);
+    logErr("removePlayer", r.error);
+  }
+
+  async function setTeamName(name){
+    name = name.trim() || "My Team";
+    S.teamName = name;
+    render();
+    var r = await sb.from("settings").update({team_name: name}).eq("id", true);
+    logErr("setTeamName", r.error);
   }
 
   // ---------- CSV export ----------
@@ -503,6 +620,14 @@
 
   function render(){
     var app = document.getElementById("app");
+    if(!S.loaded){
+      app.innerHTML = renderTopbar() + '<div class="content"><div class="hero"><h2>Loading\u2026</h2><p>Pulling the latest roster and season data.</p></div></div>';
+      var tb = document.getElementById("tabbarFixed");
+      if(tb) tb.remove();
+      renderSheet();
+      bindOnce();
+      return;
+    }
     var showTabs = S.roster.length > 0;
     var html = "";
     html += renderTopbar();
@@ -519,15 +644,13 @@
     html += '</div>';
     app.innerHTML = html;
 
-    var tabbar = document.getElementById("tabbar-el");
     renderTabbar(showTabs);
-
     renderSheet();
     bindOnce();
   }
 
   function renderTopbar(){
-    return '<div class="topbar"><h1>🏀 '+esc(S.teamName)+'</h1></div>';
+    return '<div class="topbar"><h1>\ud83c\udfc0 '+esc(S.teamName)+'</h1></div>';
   }
 
   function renderTabbar(show){
@@ -538,9 +661,9 @@
     div.className = "tabbar";
     div.id = "tabbarFixed";
     div.innerHTML =
-      tabBtn("live","🏟️","Live") +
-      tabBtn("history","📋","History") +
-      tabBtn("roster","👥","Roster");
+      tabBtn("live","\ud83c\udfdf\ufe0f","Live") +
+      tabBtn("history","\ud83d\udccb","History") +
+      tabBtn("roster","\ud83d\udc65","Roster");
     document.body.appendChild(div);
   }
   function tabBtn(id, icon, label){
@@ -551,7 +674,7 @@
   function renderRoster(onboarding){
     var html = "";
     if(onboarding){
-      html += '<div class="hero"><h2>Let\u2019s set up your team</h2><p>Add every player before your first game. You can add more anytime.</p></div>';
+      html += '<div class="hero"><h2>Let\u2019s set up your team</h2><p>Add every player before your first game. You can add more anytime, and anyone with this page open sees the same roster.</p></div>';
     } else {
       html += '<div class="field"><label>Team name</label><input type="text" id="teamNameInput" value="'+esc(S.teamName)+'"></div>';
       html += '<div class="section-title">Roster</div>';
@@ -579,7 +702,7 @@
   function renderLive(){
     var g = S.activeGame;
     if(!g){
-      var html = '<div class="hero"><h2>Ready for tip-off?</h2><p>Start a new game to begin tracking.</p></div>';
+      var html = '<div class="hero"><h2>Ready for tip-off?</h2><p>Start a new game to begin tracking. Anyone with this page open will see it live.</p></div>';
       html += '<div class="field"><label>Opponent</label><input type="text" id="oppName" placeholder="Opponent name"></div>';
       html += '<div class="field"><label>Date</label><input type="date" id="gameDate" value="'+todayISO()+'"></div>';
       html += '<button class="btn btn-primary btn-block" data-action="startGame">Start game</button>';
@@ -749,6 +872,9 @@
         if(e.target && e.target.dataset && e.target.dataset.action === "editOpp"){ setOppScoreDirect(); }
       }
     });
+    document.body.addEventListener("change", function(e){
+      if(e.target && e.target.id === "teamNameInput"){ setTeamName(e.target.value); }
+    });
   }
 
   function addPlayerFromInputs(){
@@ -760,14 +886,11 @@
 
   function onClick(e){
     var el = e.target.closest("[data-action]");
-    if(!el){
-      // team name save on outside click handled by change/blur listener below
-      return;
-    }
+    if(!el) return;
     var action = el.dataset.action;
     switch(action){
       case "setView":
-        S.view = el.dataset.view; S.expandedPlayer=null; save(); break;
+        S.view = el.dataset.view; S.expandedPlayer=null; render(); break;
       case "addPlayer":
         addPlayerFromInputs(); break;
       case "removePlayer":
@@ -781,7 +904,7 @@
       }
       case "togglePlayer":
         S.expandedPlayer = (S.expandedPlayer === el.dataset.id) ? null : el.dataset.id;
-        save(); break;
+        render(); break;
       case "statAction":
         recordPlayerAction(el.dataset.id, el.dataset.key); break;
       case "oppPts":
@@ -789,19 +912,19 @@
       case "editOpp":
         setOppScoreDirect(); break;
       case "openSheet":
-        S.showRecent = true; save(); break;
+        S.showRecent = true; render(); break;
       case "closeSheet":
-        S.showRecent = false; save(); break;
+        S.showRecent = false; render(); break;
       case "undoEntry":
         undoLogEntry(el.dataset.id); break;
       case "endGame":
         if(window.confirm("End the game and save the box score?")) endGame();
         break;
       case "histSub":
-        S.historySub = el.dataset.sub; save(); break;
+        S.historySub = el.dataset.sub; render(); break;
       case "toggleGame":
         S.openGameId = (S.openGameId === el.dataset.id) ? null : el.dataset.id;
-        save(); break;
+        render(); break;
       case "exportGame": {
         var gm = S.games.find(function(x){return x.id===el.dataset.id;});
         if(gm) exportGameCsv(gm);
@@ -813,24 +936,45 @@
         var f = el.dataset.field;
         if(S.seasonSort.field === f){ S.seasonSort.dir = S.seasonSort.dir === "desc" ? "asc" : "desc"; }
         else { S.seasonSort = {field:f, dir:"desc"}; }
-        save(); break;
+        render(); break;
       }
     }
   }
 
-  document.body.addEventListener("change", function(e){
-    if(e.target && e.target.id === "teamNameInput"){
-      S.teamName = e.target.value.trim() || "My Team";
-      save();
-    }
-  });
-
-  // clicking the backdrop closes the sheet
   document.addEventListener("click", function(e){
-    if(e.target && e.target.id === "sheetBackdrop"){ S.showRecent = false; save(); }
+    if(e.target && e.target.id === "sheetBackdrop"){ S.showRecent = false; render(); }
   });
 
-  render();
+  // ---------- realtime ----------
+  var refetchTimer = null;
+  function scheduleRefetch(){
+    clearTimeout(refetchTimer);
+    refetchTimer = setTimeout(async function(){
+      await refetchAll();
+      render();
+    }, 200);
+  }
+
+  function subscribeRealtime(){
+    sb.channel("stat-tracker-changes")
+      .on("postgres_changes", {event:"*", schema:"public", table:"players"}, scheduleRefetch)
+      .on("postgres_changes", {event:"*", schema:"public", table:"games"}, scheduleRefetch)
+      .on("postgres_changes", {event:"*", schema:"public", table:"game_stats"}, scheduleRefetch)
+      .on("postgres_changes", {event:"*", schema:"public", table:"game_log"}, scheduleRefetch)
+      .on("postgres_changes", {event:"*", schema:"public", table:"settings"}, scheduleRefetch)
+      .subscribe();
+  }
+
+  // ---------- boot ----------
+  async function boot(){
+    render();
+    await refetchAll();
+    S.loaded = true;
+    render();
+    subscribeRealtime();
+  }
+
+  boot();
 })();
 </script>
 </body>
